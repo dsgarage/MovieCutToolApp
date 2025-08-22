@@ -593,12 +593,9 @@ struct ContentView: View {
                 let outputURL = inputURL.deletingPathExtension().appendingPathExtension("srt")
                 
                 // Whisperを実行
-                let result = try await runWhisper(input: inputURL.path, output: outputURL.path)
+                try await runWhisper(input: inputURL.path, output: outputURL.path)
                 
                 await MainActor.run {
-                    outputLog += result
-                    outputLog += "\n音声認識が完了しました！\n"
-                    outputLog += "出力ファイル: \(outputURL.path)\n"
                     isProcessing = false
                 }
             } catch {
@@ -618,6 +615,21 @@ struct ContentView: View {
         let whisperPath = "\(homeDir)/Documents/dsgarageScript/MovieCutTool/third_party/whisper.cpp/build/bin/whisper-cli"
         let modelPath = "\(homeDir)/Documents/dsgarageScript/MovieCutTool/third_party/whisper.cpp/models/ggml-base.bin"
         
+        // パスの存在確認
+        await MainActor.run {
+            outputLog += "\nWhisperパス確認中...\n"
+            outputLog += "実行ファイル: \(whisperPath)\n"
+            outputLog += "モデルファイル: \(modelPath)\n"
+        }
+        
+        if !FileManager.default.fileExists(atPath: whisperPath) {
+            throw NSError(domain: "WhisperError", code: 1, userInfo: [NSLocalizedDescriptionKey: "Whisper実行ファイルが見つかりません: \(whisperPath)"])
+        }
+        
+        if !FileManager.default.fileExists(atPath: modelPath) {
+            throw NSError(domain: "WhisperError", code: 2, userInfo: [NSLocalizedDescriptionKey: "モデルファイルが見つかりません: \(modelPath)"])
+        }
+        
         // 出力ディレクトリとベース名を準備
         let outputURL = URL(fileURLWithPath: output)
         let outputDir = outputURL.deletingLastPathComponent().path
@@ -629,23 +641,69 @@ struct ContentView: View {
             "-l", "ja",           // 日本語
             "-f", input,          // 入力ファイル
             "-osrt",              // SRT形式で出力
-            "-of", "\(outputDir)/\(baseName)"  // 出力ファイルのベース名
+            "-of", "\(outputDir)/\(baseName)",  // 出力ファイルのベース名
+            "-pp"                 // プログレス表示
         ]
         
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        await MainActor.run {
+            outputLog += "\nWhisperコマンド実行中...\n"
+            outputLog += "入力: \(input)\n"
+            outputLog += "出力: \(outputDir)/\(baseName).srt\n"
+        }
+        
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        
+        // リアルタイムでログを更新
+        let outputHandle = outputPipe.fileHandleForReading
+        let errorHandle = errorPipe.fileHandleForReading
+        
+        outputHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                Task { @MainActor in
+                    self.outputLog += output
+                }
+            }
+        }
+        
+        errorHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                Task { @MainActor in
+                    self.outputLog += output
+                }
+            }
+        }
         
         try process.run()
-        process.waitUntilExit()
         
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
+        // プロセスの終了を待つ
+        await withCheckedContinuation { continuation in
+            process.terminationHandler = { _ in
+                continuation.resume()
+            }
+        }
+        
+        // ハンドラをクリーンアップ
+        outputHandle.readabilityHandler = nil
+        errorHandle.readabilityHandler = nil
         
         if process.terminationStatus == 0 {
-            return "音声認識が完了しました。\n" + output
+            // 出力ファイルの存在確認
+            let srtPath = "\(outputDir)/\(baseName).srt"
+            if FileManager.default.fileExists(atPath: srtPath) {
+                await MainActor.run {
+                    outputLog += "\n✅ SRTファイルが生成されました: \(srtPath)\n"
+                }
+                return ""
+            } else {
+                throw NSError(domain: "WhisperError", code: 3, userInfo: [NSLocalizedDescriptionKey: "SRTファイルが生成されませんでした"])
+            }
         } else {
-            throw NSError(domain: "WhisperError", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: output])
+            throw NSError(domain: "WhisperError", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: "Whisperプロセスがエラーで終了しました (code: \(process.terminationStatus))"])
         }
     }
     
