@@ -515,13 +515,39 @@ struct ContentView: View {
         // JSONをパース
         if let jsonArray = try JSONSerialization.jsonObject(with: jsonData, options: []) as? [[String: Any]] {
             var csvContent = "timestamp,author,message\n"
+            var commentCount = 0
             
             for comment in jsonArray {
+                // time_in_seconds または timestamp_usec を確認
+                var timestamp: TimeInterval? = nil
+                
+                if let timeInSeconds = comment["time_in_seconds"] as? Double {
+                    timestamp = timeInSeconds
+                } else if let timestampUsec = comment["timestamp_usec"] as? String,
+                          let usec = Double(timestampUsec) {
+                    timestamp = usec / 1000000.0 // マイクロ秒を秒に変換
+                }
+                
                 // タイムスタンプがあるコメントのみ処理
-                if let timestamp = comment["timestamp"] as? TimeInterval,
-                   let author = comment["author"] as? [String: Any],
-                   let authorName = author["name"] as? String,
-                   let message = comment["message"] as? String {
+                if let timestamp = timestamp,
+                   let authorDict = comment["author"] as? [String: Any],
+                   let authorName = authorDict["name"] as? String {
+                    
+                    // メッセージの取得（文字列または配列の場合がある）
+                    var messageText = ""
+                    if let message = comment["message"] as? String {
+                        messageText = message
+                    } else if let messageArray = comment["message_fragments"] as? [[String: Any]] {
+                        // message_fragmentsから文字列を結合
+                        messageText = messageArray.compactMap { fragment in
+                            fragment["text"] as? String
+                        }.joined()
+                    }
+                    
+                    // 空のメッセージはスキップ
+                    if messageText.isEmpty {
+                        continue
+                    }
                     
                     // タイムスタンプを時:分:秒形式に変換
                     let hours = Int(timestamp) / 3600
@@ -530,17 +556,29 @@ struct ContentView: View {
                     let timeString = String(format: "%02d:%02d:%02d", hours, minutes, seconds)
                     
                     // CSVエスケープ処理
-                    let escapedAuthor = authorName.contains(",") || authorName.contains("\"") ? "\"\(authorName.replacingOccurrences(of: "\"", with: "\"\""))\"" : authorName
-                    let escapedMessage = message.contains(",") || message.contains("\"") || message.contains("\n") ? "\"\(message.replacingOccurrences(of: "\"", with: "\"\""))\"" : message
+                    let escapedAuthor = escapeCSV(authorName)
+                    let escapedMessage = escapeCSV(messageText)
                     
                     csvContent += "\(timeString),\(escapedAuthor),\(escapedMessage)\n"
+                    commentCount += 1
                 }
             }
             
             // CSVファイルとして保存
             let csvFile = "\(outputDir)/comments.csv"
             try csvContent.write(toFile: csvFile, atomically: true, encoding: .utf8)
+            
+            await MainActor.run {
+                outputLog += "タイムスタンプ付きコメント数: \(commentCount)\n"
+            }
         }
+    }
+    
+    func escapeCSV(_ text: String) -> String {
+        if text.contains(",") || text.contains("\"") || text.contains("\n") || text.contains("\r") {
+            return "\"\(text.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+        return text
     }
     
     func transcribeWithWhisper() {
